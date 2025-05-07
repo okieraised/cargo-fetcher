@@ -1,0 +1,31 @@
+[package]
+name = "cargo-fetcher"
+version = "0.1.0"
+edition = "2024"
+authors = ["Thomas Pham <okieraised>"]
+description = "cargo-fetcher: A high-performance, asynchronous CLI downloader built in Rust.\nUtilizes HTTP range requests to split downloads into concurrent chunks with configurable parallelism.\nSupports resumable downloads by tracking completed chunks via state files."
+
+[dependencies]
+reqwest = { version = "0.12.15", features = ["stream"] }
+reqwest-middleware = "0.4.1"
+tokio = { version = "1.44.1", features = ["rt", "rt-multi-thread", "macros", "fs"] }
+futures = "0.3.31"
+tracing = "0.1.41"
+reqwest-retry = "0.7.0"
+reqwest-tracing = "0.5.6"
+indicatif = "0.17.11"
+clap = { version = "4.5.35", features = ["derive"] }
+url = "2.5.4"
+scraper = "0.23.1"
+rand = "0.8.5"
+anyhow = "1.0.97"
+
+[dependencies.uuid]
+version = "1.16.0"
+# Lets you generate random UUIDs
+features = [
+    "v4",
+]
+
+[profile.release]
+opt-level = 3
