@@ -1,64 +1,43 @@
 use crate::downloader::resource::{Resource, Status, Summary};
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use anyhow::{anyhow, Context, Result};
+use futures::{future::try_join_all, stream, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use rand::{seq::IteratorRandom, thread_rng};
 use reqwest::{
+    header::{
+        HeaderMap, HeaderValue, IntoHeaderName, ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_LENGTH,
+        CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE,
+    },
     StatusCode,
-    header::{HeaderMap, HeaderValue, IntoHeaderName, RANGE},
 };
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Error};
-use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use reqwest_tracing::TracingMiddleware;
-use std::collections::{HashMap, HashSet};
-use std::io::SeekFrom;
 use std::{fs, path::PathBuf, sync::Arc};
-use tokio::io::AsyncSeekExt;
-use tokio::sync::Semaphore;
-use tokio::time::{Duration, timeout};
-use tokio::{fs::OpenOptions, io::AsyncWriteExt};
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
+    sync::Semaphore,
+    time::{timeout, Duration},
+};
+use std::io::SeekFrom;
 use uuid::Uuid;
-
-fn get_random_user_agent() -> String {
-    let mut user_agents = HashMap::new();
-    user_agents.insert("chrome", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-    user_agents.insert(
-        "firefox",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
-    );
-    user_agents.insert("safari", "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15");
-    user_agents.insert("edge", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0");
-
-    // Randomly pick a user agent
-    let mut rng = thread_rng();
-    let (_, random_ua) = user_agents.iter().choose(&mut rng).unwrap();
-    random_ua.to_string()
-}
 
 pub struct TimeTrace;
 
 #[derive(Debug, Clone)]
 pub struct Downloader {
-    /// Directory where to store the downloaded files.
     directory: PathBuf,
-    /// Number of retries per downloaded file.
     retries: u32,
-    /// Number of maximum concurrent downloads.
     concurrent_downloads: usize,
-    /// Number of chunked download per file.
     concurrent_chunk: usize,
-    /// Size of each chunk
     chunk_size: u64,
-    /// Downloader style options.
     style_options: StyleOptions,
-    /// Custom HTTP headers.
     headers: Option<HeaderMap>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StyleOptions {
-    /// Style options for the main progress bar.
     main: ProgressBarOpts,
-    /// Style options for the child progress bar(s).
     child: ProgressBarOpts,
 }
 
@@ -77,40 +56,25 @@ impl Default for StyleOptions {
 }
 
 impl StyleOptions {
-    /// Create new [`Downloader`] [`StyleOptions`].
     pub fn new(main: ProgressBarOpts, child: ProgressBarOpts) -> Self {
         Self { main, child }
     }
-
-    /// Set the options for the main progress bar.
     pub fn set_main(&mut self, main: ProgressBarOpts) {
         self.main = main;
     }
-
-    /// Set the options for the child progress bar.
     pub fn set_child(&mut self, child: ProgressBarOpts) {
         self.child = child;
     }
-
-    /// Return `false` if neither the main nor the child bar is enabled.
-    pub fn is_enabled(self) -> bool {
+    pub fn is_enabled(&self) -> bool {
         self.main.enabled || self.child.enabled
     }
 }
 
-/// Define the options for a progress bar.
 #[derive(Debug, Clone)]
 pub struct ProgressBarOpts {
-    /// Progress bar template string.
     template: Option<String>,
-    /// Progression characters set.
-    ///
-    /// There must be at least 3 characters for the following states:
-    /// "filled", "current", and "to do".
     progress_chars: Option<String>,
-    /// Enable or disable the progress bar.
     enabled: bool,
-    /// Clear the progress bar once completed.
     clear: bool,
 }
 
@@ -128,8 +92,8 @@ impl Default for ProgressBarOpts {
 impl ProgressBarOpts {
     pub const TEMPLATE_BAR_WITH_POSITION: &'static str =
         "{bar:40.blue} {pos:>}/{len} ({percent}%) eta {eta_precise:.blue}";
-
-    pub const TEMPLATE_PIP: &'static str = "{bar:40.green/black} {bytes:>11.green}/{total_bytes:<11.green} {bytes_per_sec:>13.red} eta {eta:.blue}";
+    pub const TEMPLATE_PIP: &'static str =
+        "{bar:40.green/black} {bytes:>11.green}/{total_bytes:<11.green} {bytes_per_sec:>13.red} eta {eta:.blue}";
     pub const CHARS_LINE: &'static str = "━╾╴─";
 
     pub fn new(
@@ -188,12 +152,10 @@ impl ProgressBarOpts {
 
 impl Downloader {
     const DEFAULT_RETRIES: u32 = 3;
-
     const DEFAULT_CONCURRENT_DOWNLOADS: usize = 32;
-
     const DEFAULT_CONCURRENT_CHUNK: usize = 8;
-
     const DEFAULT_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
+    const CHUNK_TIMEOUT_SECS: u64 = 30;
 
     pub async fn download(&self, downloads: &[Resource], insecure: Option<bool>) -> Vec<Summary> {
         self.download_inner(downloads, None, insecure).await
@@ -216,32 +178,50 @@ impl Downloader {
     ) -> Vec<Summary> {
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(self.retries);
 
+        // Build inner client with enforced identity encoding
         let mut inner_client_builder = reqwest::Client::builder();
+
         if let Some(proxy) = proxy {
             inner_client_builder = inner_client_builder.proxy(proxy);
         }
-        if let Some(headers) = &self.headers {
-            inner_client_builder = inner_client_builder.default_headers(headers.clone());
-        }
+
+        let mut default_headers = self.headers.clone().unwrap_or_else(HeaderMap::new);
+        default_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        inner_client_builder = inner_client_builder.default_headers(default_headers);
+
         if let Some(insecure) = insecure {
             inner_client_builder = inner_client_builder
                 .danger_accept_invalid_certs(insecure)
                 .danger_accept_invalid_hostnames(insecure);
         }
 
-        let id = Uuid::new_v4().to_string();
-        inner_client_builder = inner_client_builder.user_agent(id+"-cargo-fetcher");
+        inner_client_builder =
+            inner_client_builder.user_agent(format!("cargo-fetcher/{}", Uuid::new_v4()));
 
-        let inner_client = inner_client_builder.build().unwrap();
+        let inner_client = match inner_client_builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("failed to build reqwest client: {e}");
+                return downloads
+                    .iter()
+                    .map(|d| {
+                        Summary::new(d.clone(), StatusCode::BAD_REQUEST, 0)
+                            .fail(anyhow::anyhow!(msg.clone()))
+                    })
+                    .collect();
+            }
+        };
 
         let client = ClientBuilder::new(inner_client)
             .with(TracingMiddleware::default())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
-        let multi = match self.style_options.clone().is_enabled() {
-            true => Arc::new(MultiProgress::new()),
-            false => Arc::new(MultiProgress::with_draw_target(ProgressDrawTarget::hidden())),
+        // Progress
+        let multi = if self.style_options.is_enabled() {
+            Arc::new(MultiProgress::new())
+        } else {
+            Arc::new(MultiProgress::with_draw_target(ProgressDrawTarget::hidden()))
         };
         let main = Arc::new(
             multi.add(
@@ -268,6 +248,80 @@ impl Downloader {
         summaries
     }
 
+    async fn probe(
+        &self,
+        client: &ClientWithMiddleware,
+        url: &str,
+        headers: Option<HeaderMap>,
+    ) -> Result<Probe> {
+        // 1) Try a HEAD with identity to gather ETag/Last-Modified/Accept-Ranges/Content-Length
+        let mut head = client.head(url).header(ACCEPT_ENCODING, "identity");
+        if let Some(h) = headers.clone() {
+            head = head.headers(h);
+        }
+        let head_res = head.send().await;
+
+        let (mut size_from_head, mut etag, mut last_modified, mut accept_ranges_bytes) =
+            (None, None, None, false);
+
+        if let Ok(res) = head_res {
+            if res.status().is_success() {
+                if let Some(v) = res.headers().get(CONTENT_LENGTH) {
+                    if let Ok(s) = v.to_str() {
+                        size_from_head = s.parse::<u64>().ok();
+                    }
+                }
+                if let Some(v) = res.headers().get(ETAG) {
+                    etag = v.to_str().ok().map(|s| s.to_string());
+                }
+                if let Some(v) = res.headers().get(LAST_MODIFIED) {
+                    last_modified = v.to_str().ok().map(|s| s.to_string());
+                }
+                if let Some(v) = res.headers().get(ACCEPT_RANGES) {
+                    if v.as_bytes().eq_ignore_ascii_case(b"bytes") {
+                        accept_ranges_bytes = true;
+                    }
+                }
+            }
+        }
+
+        // 2) Probe with Range: bytes=0-0 (identity) to get total from Content-Range
+        let mut probe = client
+            .get(url)
+            .header(ACCEPT_ENCODING, "identity")
+            .header(RANGE, "bytes=0-0");
+        if let Some(h) = headers {
+            probe = probe.headers(h);
+        }
+
+        let resp = probe.send().await.context("probe GET failed")?;
+
+        let (supports_ranges, total_size) = if resp.status() == StatusCode::PARTIAL_CONTENT {
+            // Parse "bytes 0-0/total"
+            let total = parse_total_from_content_range(resp.headers().get(CONTENT_RANGE))
+                .context("missing/invalid Content-Range on probe")?;
+            (true, total)
+        } else if resp.status().is_success() {
+            // Server ignored Range → not range-friendly; fall back to single-stream.
+            let total = size_from_head.unwrap_or(0);
+            (false, total)
+        } else {
+            return Err(anyhow!("probe unexpected HTTP {}", resp.status()));
+        };
+
+        // Prefer strong ETag; if weak (W/...), prefer Last-Modified for If-Range.
+        let if_range = match etag.as_deref() {
+            Some(et) if !et.starts_with("W/") => Some(IfRange::ETag(et.to_string())),
+            _ => last_modified.map(IfRange::LastModified),
+        };
+
+        Ok(Probe {
+            total_size,
+            supports_ranges: supports_ranges && accept_ranges_bytes,
+            if_range,
+        })
+    }
+
     async fn fetch(
         &self,
         client: &ClientWithMiddleware,
@@ -275,222 +329,280 @@ impl Downloader {
         multi: Arc<MultiProgress>,
         main: Arc<ProgressBar>,
     ) -> Summary {
-        let mut size_on_disk: u64 = 0;
         let output = self.directory.join(&download.filename);
-        let summary = Summary::new(download.clone(), StatusCode::BAD_REQUEST, size_on_disk);
+        let tmp = output.with_extension("part");
 
-        let content_length = match download.content_length(client).await {
-            Ok(l) => l.unwrap_or(0),
+        let mut summary = Summary::new(download.clone(), StatusCode::BAD_REQUEST, 0);
+
+        // Ensure parent dir
+        if let Some(parent) = output.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                return summary.fail(e);
+            }
+        }
+
+        // Probe the resource with identity encoding
+        let probe = match self.probe(client, (&download.url).as_ref(), self.headers.clone()).await {
+            Ok(p) => p,
             Err(e) => return summary.fail(e),
         };
 
-        if content_length == 0 {
-            let pb = multi.add(
-                self.style_options
-                    .child
-                    .clone()
-                    .to_progress_bar(content_length)
-                    .with_position(0),
-            );
+        // Progress bar length is the *true* total size if known
+        let pb = multi.add(
+            self.style_options
+                .child
+                .clone()
+                .to_progress_bar(probe.total_size)
+                .with_position(0),
+        );
 
-            let mut req = client.get(download.url.clone());
-
-            if let Some(ref h) = self.headers {
-                req = req.headers(h.to_owned());
+        // If file already exists and is complete, skip
+        if output.exists() {
+            match output.metadata() {
+                Ok(m) if m.len() == probe.total_size && probe.total_size > 0 => {
+                    main.inc(1);
+                    if self.style_options.child.clear {
+                        pb.finish_and_clear();
+                    } else {
+                        pb.finish();
+                    }
+                    return summary.with_status(Status::Skipped(
+                        "the file was already fully downloaded".into(),
+                    ));
+                }
+                _ => {}
             }
+        }
+
+        // Always write to a .part file then rename atomically
+        // SINGLE-STREAM PATH
+        if !probe.supports_ranges || probe.total_size == 0 {
+            let mut req = client
+                .get(download.url.clone())
+                .header(ACCEPT_ENCODING, "identity");
+            if let Some(ref h) = self.headers {
+                req = req.headers(h.clone());
+            }
+
+            // Open tmp with truncate
+            let f = match OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => return summary.fail(e),
+            };
+            let mut file = BufWriter::new(f);
+            let mut size_on_disk: u64 = 0;
 
             let res = match req.send().await {
                 Ok(res) => res,
-                Err(e) => {
-                    return summary.fail(e);
-                }
+                Err(e) => return summary.fail(e),
             };
-
-            let mut file = match OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(true)
-                .open(&output)
-                .await
-            {
-                Ok(file) => file,
-                Err(e) => {
-                    return summary.fail(e);
-                }
-            };
-
-            let mut stream = res.bytes_stream();
-            while let Some(item) = stream.next().await {
-                let mut chunk = match item {
-                    Ok(chunk) => chunk,
-                    Err(e) => {
-                        return summary.fail(e);
-                    }
-                };
-                let chunk_size = chunk.len() as u64;
-                pb.inc(chunk_size);
-                size_on_disk += chunk_size;
-
-                // Write the chunk to disk.
-                match file.write_all(&chunk).await {
-                    Ok(_res) => (),
-                    Err(e) => {
-                        return summary.fail(e);
-                    }
-                };
+            if !res.status().is_success() {
+                return summary.fail(anyhow!("HTTP {}", res.status()));
             }
 
-            match file.flush().await {
-                Ok(()) => {}
-                Err(e) => {
-                    return summary.fail(e);
+            let mut stream = res.bytes_stream();
+            loop {
+                match timeout(Duration::from_secs(Self::CHUNK_TIMEOUT_SECS), stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            return summary.fail(e);
+                        }
+                        size_on_disk += chunk.len() as u64;
+                        pb.inc(chunk.len() as u64);
+                    }
+                    Ok(Some(Err(e))) => return summary.fail(e),
+                    Ok(None) => break,
+                    Err(_) => return summary.fail(anyhow!("timeout while streaming body")),
                 }
-            };
+            }
+
+            if let Err(e) = file.flush().await {
+                return summary.fail(e);
+            }
+
+            // Rename into place
+            if let Err(e) = tokio::fs::rename(&tmp, &output).await {
+                return summary.fail(e);
+            }
 
             if self.style_options.child.clear {
                 pb.finish_and_clear();
             } else {
                 pb.finish();
             }
-
             main.inc(1);
 
             return Summary::new(download.clone(), StatusCode::OK, size_on_disk)
                 .with_status(Status::Success);
         }
 
-        if output.exists() {
-            println!("A file with the same name already exists at the destination.");
-            size_on_disk = match output.metadata() {
-                Ok(m) => m.len(),
+        // RANGED PATH
+        // Create/truncate tmp and set final length
+        {
+            let f = match OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .await
+            {
+                Ok(f) => f,
                 Err(e) => return summary.fail(e),
             };
+            if let Err(e) = f.set_len(probe.total_size).await {
+                return summary.fail(e);
+            }
         }
 
-        if content_length == size_on_disk {
-            main.inc(1);
-            return summary.with_status(Status::Skipped(
-                "the file was already fully downloaded".into(),
-            ));
-        }
-
-        if let Err(e) = fs::create_dir_all(output.parent().unwrap_or(&output)) {
-            return summary.fail(e);
-        }
-
-        // Create or open the output file
-        let file = match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .open(&output)
-            .await
-        {
-            Ok(f) => f,
-            Err(e) => return summary.fail(e),
-        };
-
-        let pb = multi.add(
-            self.style_options
-                .child
-                .clone()
-                .to_progress_bar(content_length)
-                .with_position(0),
-        );
-
-        let indexed_ranges: Vec<(usize, u64, u64)> = (0..content_length)
+        // Build ranges
+        let indexed_ranges: Vec<(u64, u64)> = (0..probe.total_size)
             .step_by(self.chunk_size as usize)
-            .enumerate()
-            .map(|(index, start)| {
-                let end = (start + self.chunk_size - 1).min(content_length - 1);
-                (index, start, end)
+            .map(|start| {
+                let end = (start + self.chunk_size - 1).min(probe.total_size - 1);
+                (start, end)
             })
             .collect();
 
-        let chunk_number = (self.concurrent_chunk).min(indexed_ranges.len());
-        let semaphore = Arc::new(Semaphore::new(chunk_number));
-        let mut chunk_tasks = Vec::new();
+        let permits = self
+            .concurrent_chunk
+            .max(1)
+            .min(indexed_ranges.len().max(1));
+        let semaphore = Arc::new(Semaphore::new(permits));
 
-        for (_, start, end) in indexed_ranges {
+        let mut tasks = Vec::with_capacity(indexed_ranges.len());
+        for (start, end) in indexed_ranges {
             let semaphore = semaphore.clone();
             let client = client.clone();
-            let output = output.clone();
+            let tmp = tmp.clone();
             let pb = pb.clone();
-
             let url = download.url.clone();
-            let chunk = tokio::spawn(async move {
-                let permit = match semaphore.acquire().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Err(Error::from(anyhow::Error::from(e)));
-                    },
-                };
+            let headers = self.headers.clone();
+            let if_range = probe.if_range.clone();
 
-                let range_header = format!("bytes={}-{}", start, end);
-                let req = client.get(url).header(RANGE, range_header);
+            let task = tokio::spawn(async move {
+                let _permit = semaphore.acquire().await.context("semaphore closed")?;
 
-                let resp = match req.send().await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        return Err(Error::from(anyhow::Error::from(e)));
+                // Prepare request
+                let mut req = client
+                    .get(url)
+                    .header(ACCEPT_ENCODING, "identity")
+                    .header(RANGE, format!("bytes={}-{}", start, end));
+
+                if let Some(h) = headers.clone() {
+                    req = req.headers(h);
+                }
+                if let Some(ir) = if_range {
+                    match ir {
+                        IfRange::ETag(et) => {
+                            req = req.header(IF_RANGE, et);
+                        }
+                        IfRange::LastModified(lm) => {
+                            req = req.header(IF_RANGE, lm);
+                        }
                     }
-                };
+                }
+
+                let resp = req.send().await.context("range request failed")?;
+
+                if resp.status() != StatusCode::PARTIAL_CONTENT {
+                    return Err(anyhow!(
+                        "server did not return 206 for range {}-{} (got {})",
+                        start,
+                        end,
+                        resp.status()
+                    ));
+                }
+
+                // Content-Range sanity
+                if let Some(cr) = resp.headers().get(CONTENT_RANGE) {
+                    let crs = cr.to_str().unwrap_or_default();
+                    if !(crs.starts_with("bytes ")
+                        && crs.contains(&format!("{}-", start))
+                        && crs.contains(&format!("-{}", end)))
+                    {
+                        return Err(anyhow!("unexpected Content-Range: {}", crs));
+                    }
+                }
 
                 let mut stream = resp.bytes_stream();
 
-                let mut file = match OpenOptions::new().write(true).append(true).open(&output).await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        return Err(Error::from(anyhow::Error::from(e)));
-                    }
-                };
+                // Open tmp and write at offset
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(&tmp)
+                    .await
+                    .context("open tmp for ranged write failed")?;
 
-                match file.seek(SeekFrom::Start(start)).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        return Err(Error::from(anyhow::Error::from(e)));
-                    }
-                };
+                file.seek(SeekFrom::Start(start))
+                    .await
+                    .context("seek failed")?;
 
-                while let Ok(Some(item)) = timeout(Duration::from_secs(10), stream.next()).await {
-                    let mut chunk = match item {
-                        Ok(chunk) => chunk,
-                        Err(e) => {
-                            return Err(Error::from(anyhow::Error::from(e)));
+                let expected = end - start + 1;
+                let mut written: u64 = 0;
+
+                loop {
+                    match timeout(Duration::from_secs(Downloader::CHUNK_TIMEOUT_SECS), stream.next())
+                        .await
+                    {
+                        Ok(Some(Ok(chunk))) => {
+                            file.write_all(&chunk).await.context("write_all failed")?;
+                            written += chunk.len() as u64;
+                            pb.inc(chunk.len() as u64);
                         }
-                    };
-                    pb.inc(chunk.len() as u64);
-                    match file.write_all(&chunk).await {
-                        Ok(()) => (),
-                        Err(e) => {
-                            return Err(Error::from(anyhow::Error::from(e)));
+                        Ok(Some(Err(e))) => return Err(anyhow!(e)),
+                        Ok(None) => break,
+                        Err(_) => {
+                            return Err(anyhow!("timeout while reading range {}-{}", start, end));
                         }
-                    };
+                    }
                 }
 
-                match file.flush().await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        return Err(Error::from(anyhow::Error::from(e)));
-                    }
-                };
-                drop(permit);
+                if written != expected {
+                    return Err(anyhow!(
+                        "short write for range {}-{}: wrote {}, expected {}",
+                        start,
+                        end,
+                        written,
+                        expected
+                    ));
+                }
 
-
-                Ok(())
+                file.flush().await.context("flush failed")?;
+                Ok::<(), anyhow::Error>(())
             });
-            chunk_tasks.push(chunk);
+
+            tasks.push(task);
         }
 
-        let mut responses = Vec::new();
-        for jh in chunk_tasks {
-            let response = match jh.await {
-                Ok(res) => {res}
-                Err(e) => {
-                    return summary.fail(e);
+        let results = try_join_all(tasks).await;
+        if let Err(join_err) = results {
+            if self.style_options.child.clear {
+                pb.finish_and_clear();
+            } else {
+                pb.finish();
+            }
+            return summary.fail(anyhow!("join error: {}", join_err));
+        }
+        for res in results.unwrap() {
+            if let Err(e) = res {
+                if self.style_options.child.clear {
+                    pb.finish_and_clear();
+                } else {
+                    pb.finish();
                 }
-            };
-            responses.push(response);
+                return summary.fail(e);
+            }
+        }
+
+        // All chunks ok → atomically move into place
+        if let Err(e) = tokio::fs::rename(&tmp, &output).await {
+            return summary.fail(e);
         }
 
         if self.style_options.child.clear {
@@ -498,11 +610,30 @@ impl Downloader {
         } else {
             pb.finish();
         }
-
         main.inc(1);
 
-        Summary::new(download.clone(), StatusCode::OK, content_length).with_status(Status::Success)
+        Summary::new(download.clone(), StatusCode::OK, probe.total_size).with_status(Status::Success)
     }
+}
+
+fn parse_total_from_content_range(v: Option<&HeaderValue>) -> Option<u64> {
+    // "bytes START-END/TOTAL"
+    let s = v?.to_str().ok()?;
+    let slash = s.rsplit('/').next()?;
+    slash.parse::<u64>().ok()
+}
+
+#[derive(Clone, Debug)]
+struct Probe {
+    total_size: u64,
+    supports_ranges: bool,
+    if_range: Option<IfRange>,
+}
+
+#[derive(Clone, Debug)]
+enum IfRange {
+    ETag(String),
+    LastModified(String),
 }
 
 pub struct DownloaderBuilder(Downloader);
@@ -560,16 +691,13 @@ impl DownloaderBuilder {
     pub fn headers(mut self, headers: HeaderMap) -> Self {
         let mut new = self.new_header();
         new.extend(headers);
-
         self.0.headers = Some(new);
         self
     }
 
     pub fn header<K: IntoHeaderName>(mut self, name: K, value: HeaderValue) -> Self {
         let mut new = self.new_header();
-
         new.insert(name, value);
-
         self.0.headers = Some(new);
         self
     }
